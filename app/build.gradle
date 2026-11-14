@@ -1,0 +1,16 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.parental.controller'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.parental.controller'
+        minSdk 29
+        targetSdk 32
+        versionCode 1
+        versionName '1.0'
+    }
+}
