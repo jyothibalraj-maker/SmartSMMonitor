@@ -16,6 +16,7 @@ public class MonitorService extends Service {
     private static final int NOTIFICATION_ID = 1001;
     private Handler handler;
     private long currentHourStart;
+    private long windowStart;
     private boolean blocked = false;
     private final Runnable tick = new Runnable() {
         @Override public void run() {
@@ -23,19 +24,21 @@ public class MonitorService extends Service {
             long now = System.currentTimeMillis();
             long hourStart = now - (now % 3600000L);
             if (hourStart != currentHourStart) {
-                if (currentHourStart != 0) sendReport(currentHourStart, currentHourStart + 3600000L);
+                if (currentHourStart != 0) sendReport(windowStart, hourStart);
                 currentHourStart = hourStart;
+                windowStart = hourStart;
                 blocked = false;
                 stopService(new Intent(MonitorService.this, SelectiveVpnService.class));
             }
-            long usage = getCombinedUsage(currentHourStart, now);
-            if (usage >= 5 * 60 * 1000L && !blocked) {
+            long allowanceMs = AppPrefs.allowanceMinutes(MonitorService.this) * 60 * 1000L;
+            long usage = getCombinedUsage(windowStart, now);
+            if (usage >= allowanceMs && !blocked) {
                 blocked = true;
                 Intent vpn = new Intent(MonitorService.this, SelectiveVpnService.class);
                 vpn.setAction(SelectiveVpnService.ACTION_BLOCK);
                 if (Build.VERSION.SDK_INT >= 26) startForegroundService(vpn); else startService(vpn);
             }
-            updateNotification(usage);
+            updateNotification(usage, allowanceMs);
             handler.postDelayed(this, 15000);
         }
     };
@@ -45,7 +48,13 @@ public class MonitorService extends Service {
         handler = new Handler(Looper.getMainLooper());
         createChannel();
         startForeground(NOTIFICATION_ID, notification("Monitoring social media usage"));
-        currentHourStart = System.currentTimeMillis() - (System.currentTimeMillis() % 3600000L);
+        long now = System.currentTimeMillis();
+        currentHourStart = now - (now % 3600000L);
+        // Only count usage from when monitoring was actually turned on, so a child
+        // who already used an app earlier in the clock hour (before Start monitoring
+        // was tapped) isn't blocked immediately.
+        long monitorStart = AppPrefs.monitorStartTime(this);
+        windowStart = Math.max(currentHourStart, monitorStart);
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -54,8 +63,20 @@ public class MonitorService extends Service {
         return START_STICKY;
     }
 
+    @Override public void onTaskRemoved(Intent rootIntent) {
+        super.onTaskRemoved(rootIntent);
+        // Try to come back if the app is swiped away from Recents while monitoring
+        // is on. START_STICKY already asks Android to restart the service, this
+        // just gives it an immediate nudge.
+        if (AppPrefs.enabled(this)) {
+            Intent restart = new Intent(getApplicationContext(), MonitorService.class);
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(restart); else startService(restart);
+        }
+    }
+
     private long getCombinedUsage(long start, long end) {
-        UsageStatsManager manager = (UsageStatsManager)getSystemService(USAGE_STATS_SERVICE);
+        if (end <= start) return 0;
+        UsageStatsManager manager = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
         Map<String, UsageStats> stats = manager.queryAndAggregateUsageStats(start, end);
         long total = 0;
         for (String pkg : AppPrefs.selected(this)) {
@@ -69,19 +90,21 @@ public class MonitorService extends Service {
         String number = AppPrefs.phone(this);
         if (number.isEmpty() || checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) return;
         long used = getCombinedUsage(start, end);
+        long allowanceMs = AppPrefs.allowanceMinutes(this) * 60 * 1000L;
         StringBuilder report = new StringBuilder("Social media usage ");
         SimpleDateFormat fmt = new SimpleDateFormat("h:mm a", Locale.getDefault());
         report.append(fmt.format(new Date(start))).append(" - ").append(fmt.format(new Date(end))).append("\n");
         for (String pkg : AppPrefs.selected(this)) {
             long appUsage = 0;
-            UsageStats s = ((UsageStatsManager)getSystemService(USAGE_STATS_SERVICE))
+            UsageStats s = ((UsageStatsManager) getSystemService(USAGE_STATS_SERVICE))
                     .queryAndAggregateUsageStats(start, end).get(pkg);
             if (s != null) appUsage = s.getTotalTimeInForeground();
             report.append(label(pkg)).append(": ").append(appUsage / 60000).append("m ")
-                  .append((appUsage % 60000) / 1000).append("s\n");
+                    .append((appUsage % 60000) / 1000).append("s\n");
         }
         report.append("Combined: ").append(used / 60000).append("m ").append((used % 60000) / 1000)
-              .append("s. Limit: 5m. ").append(used >= 300000 ? "Limit exceeded." : "Within limit.");
+                .append("s. Limit: ").append(allowanceMs / 60000).append("m. ")
+                .append(used >= allowanceMs ? "Limit exceeded." : "Within limit.");
         try {
             SmsManager sms = SmsManager.getDefault();
             ArrayList<String> parts = sms.divideMessage(report.toString());
@@ -115,10 +138,10 @@ public class MonitorService extends Service {
                 .setSmallIcon(android.R.drawable.ic_lock_idle_lock).setOngoing(true).build();
     }
 
-    private void updateNotification(long usage) {
-        NotificationManager nm = (NotificationManager)getSystemService(NOTIFICATION_SERVICE);
+    private void updateNotification(long usage, long allowanceMs) {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         nm.notify(NOTIFICATION_ID, notification("Combined usage this hour: " + (usage / 60000) + "m " +
-                ((usage % 60000) / 1000) + "s / 5m" + (blocked ? " — internet blocked" : "")));
+                ((usage % 60000) / 1000) + "s / " + (allowanceMs / 60000) + "m" + (blocked ? " — internet blocked" : "")));
     }
 
     @Override public void onDestroy() {
